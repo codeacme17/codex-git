@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "checks": [
+    {
+      "id": "codex-host-smoke",
+      "codexVersion": null,
+      "status": "pending",
+      "performedAt": null,
+      "environment": null,
+      "record": null,
+      "sourceRevision": null,
+      "validUntil": null
+    },
+    {
+      "id": "voiceover-keyboard-smoke",
+      "codexVersion": null,
+      "status": "pending",
+      "performedAt": null,
+      "environment": null,
+      "record": null,
+      "sourceRevision": null,
+      "validUntil": null
+    }
+  ]
+}

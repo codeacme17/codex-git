@@ -94,6 +94,42 @@ describe('CodexCdpHostAdapter', () => {
     expect(nativeSurface?.hidden).toBe(false);
   });
 
+  it('fails closed for build 6962 after live CSP validation failed', async () => {
+    const dom = build6962CompatibleDom();
+    const before = dom.window.document.documentElement.outerHTML;
+
+    const result = await new CodexCdpHostAdapter({
+      rendererSource: new FixtureRendererSource(
+        fixtureRenderer(dom, '26.818.41509'),
+      ),
+    }).attach({
+      title: 'Codex Git',
+      url: new URL('http://127.0.0.1:4173'),
+    });
+
+    expect(result).toMatchObject({
+      kind: 'standalone-required',
+      reason: { code: 'incompatible-host' },
+    });
+    expect(dom.window.document.documentElement.outerHTML).toBe(before);
+  });
+
+  it('rejects a version and build from different tested profiles', async () => {
+    const dom = build6962CompatibleDom();
+
+    const result = await new CodexCdpHostAdapter({
+      rendererSource: new FixtureRendererSource(
+        fixtureRenderer(dom, '26.818.41509', '7119'),
+      ),
+    }).attach({
+      title: 'Codex Git',
+      url: new URL('http://127.0.0.1:4173'),
+    });
+
+    expect(result.kind).toBe('standalone-required');
+    expect(documentEntry(dom)).toBeNull();
+  });
+
   it('keeps exactly one entry when the adapter attaches repeatedly', async () => {
     const dom = compatibleDom();
     const renderer = fixtureRenderer(dom, '26.820.60940');
@@ -420,6 +456,21 @@ function compatibleDom(): JSDOM {
   `);
 }
 
+function build6962CompatibleDom(): JSDOM {
+  return new JSDOM(`
+    <div id="root">
+      <aside class="app-shell-left-panel">
+        <button class="sidebar-item w-full" data-native-entry type="button">Tasks</button>
+        <section class="relative px-row-x">
+          <button data-app-action-sidebar-section-toggle type="button">Projects</button>
+          <div aria-current="page" data-app-action-sidebar-project-row></div>
+        </section>
+      </aside>
+      <main data-app-shell-main-surface="default">Native task</main>
+    </div>
+  `);
+}
+
 function documentEntry(dom: JSDOM): HTMLButtonElement | null {
   return dom.window.document.querySelector('[data-codex-git-sidebar-entry]');
 }
@@ -492,12 +543,22 @@ function captureNextFrameMessage(
   });
 }
 
-function fixtureRenderer(dom: JSDOM, version: string): CodexRenderer {
-  return new FixtureRenderer(dom, version, {
-    projectPath: null,
-    task: null,
-    theme: 'system',
-  });
+function fixtureRenderer(
+  dom: JSDOM,
+  version: string,
+  build = version === '26.818.41509' ? '6962' : '7119',
+): CodexRenderer {
+  return new FixtureRenderer(
+    dom,
+    version,
+    {
+      projectPath: null,
+      task: null,
+      theme: 'system',
+    },
+    [],
+    build,
+  );
 }
 
 class FixtureRenderer implements CodexRenderer {
@@ -513,6 +574,7 @@ class FixtureRenderer implements CodexRenderer {
     readonly version: string,
     private context: HostContext,
     private readonly leaseEvents: string[] = [],
+    readonly build = '7119',
   ) {
     this.document = dom.window.document;
     this.window = dom.window as unknown as Window & typeof globalThis;

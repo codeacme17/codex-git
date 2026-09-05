@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { loadFrameDocument } from './frame-document.js';
 
 import type {
   HostContext,
@@ -12,6 +13,10 @@ import {
   type CdpSession,
 } from './cdp-session.js';
 import { acquireDedicatedRendererCspBypass } from './csp-bypass.js';
+import {
+  findCodexCompatibilityProfile,
+  type CodexCompatibilityProfile,
+} from './compatibility-profile.js';
 import type {
   ConnectDedicatedRendererRequest,
   DedicatedProjectIdentity,
@@ -20,11 +25,8 @@ import type {
 } from './dedicated-adapter.js';
 import type { CspBypassLease } from './renderer.js';
 
-const supportedCodexVersion = '26.820.60940';
-const supportedCodexBuild = '7119';
-const supportedChromiumProduct = 'Chrome/151.0.7922.170';
-
 export interface ConnectDedicatedCodexRendererOptions {
+  readonly loadDocument?: () => Promise<string>;
   readonly connect?: (url: string) => Promise<CdpSession>;
   readonly createBindingName?: () => string;
   readonly wait?: (milliseconds: number) => Promise<void>;
@@ -34,11 +36,12 @@ export async function connectDedicatedCodexRenderer(
   request: ConnectDedicatedRendererRequest,
   options: ConnectDedicatedCodexRendererOptions = {},
 ): Promise<DedicatedRendererConnection> {
-  if (
-    request.version !== supportedCodexVersion ||
-    request.build !== supportedCodexBuild
-  ) {
+  const profile = findCodexCompatibilityProfile(request.version, request.build);
+  if (profile === null) {
     throw new Error('Unsupported Codex Desktop version');
+  }
+  if (profile.documentInjection && options.loadDocument === undefined) {
+    throw new Error('The embedded document loader is unavailable');
   }
   const session = await (options.connect ?? connectCdpSession)(
     request.target.webSocketUrl,
@@ -46,7 +49,7 @@ export async function connectDedicatedCodexRenderer(
   let lease: CspBypassLease | null = null;
   try {
     const browser = await session.send('Browser.getVersion');
-    if (!isRecord(browser) || browser.product !== supportedChromiumProduct) {
+    if (!isRecord(browser) || browser.product !== profile.chromiumProduct) {
       throw new Error('Unsupported Codex Desktop Chromium version');
     }
     await session.send('Runtime.enable');
@@ -62,14 +65,14 @@ export async function connectDedicatedCodexRenderer(
       request.target.id,
       cspOwnershipScope(request),
     );
-    let installation = await install(session, request, bindingName, 1);
+    let installation = await install(session, request, profile, bindingName, 1);
     for (
       let attempt = 0;
       installation.status === 'not-ready' && attempt < 100;
       attempt++
     ) {
       await (options.wait ?? wait)(100);
-      installation = await install(session, request, bindingName, 1);
+      installation = await install(session, request, profile, bindingName, 1);
     }
     if (installation.status !== 'attached') {
       throw new Error(
@@ -82,8 +85,10 @@ export async function connectDedicatedCodexRenderer(
       session,
       lease,
       request,
+      profile,
       bindingName,
       installation,
+      options.loadDocument,
     );
     lease = null;
     return connection;
@@ -122,13 +127,16 @@ class RemoteDedicatedRendererConnection implements DedicatedRendererConnection {
     private readonly session: CdpSession,
     private cspLease: CspBypassLease | null,
     private readonly request: ConnectDedicatedRendererRequest,
+    private readonly profile: CodexCompatibilityProfile,
     private readonly bindingName: string,
     installation: AttachedInstallation,
+    private readonly loadDocument?: () => Promise<string>,
   ) {
     this.context = installation.context;
     this.open = installation.open;
     this.project = installation.project;
     this.unsubscribe = session.subscribe(this.handleCdpEvent);
+    if (this.open) this.queueDocument();
   }
 
   currentContext(): HostContext {
@@ -150,6 +158,12 @@ class RemoteDedicatedRendererConnection implements DedicatedRendererConnection {
 
   async perform(action: NativeHostAction): Promise<NativeActionResult> {
     if (this.closed) {
+      return { status: 'rejected' };
+    }
+    if (
+      action.kind === 'open-codex-context' &&
+      this.context.projectPath !== this.request.projectPath
+    ) {
       return { status: 'rejected' };
     }
     if (
@@ -189,6 +203,7 @@ class RemoteDedicatedRendererConnection implements DedicatedRendererConnection {
         this.listeners.forEach((listener) => listener(message));
       } else if (message?.kind === 'surface') {
         this.open = message.open;
+        if (this.open) this.queueDocument();
       } else if (message?.kind === 'standalone-required') {
         this.listeners.forEach((listener) => listener(message));
       }
@@ -206,6 +221,26 @@ class RemoteDedicatedRendererConnection implements DedicatedRendererConnection {
     }
   };
 
+  private queueDocument(): void {
+    if (!this.profile.documentInjection || this.loadDocument === undefined)
+      return;
+    this.refresh = this.refresh.then(async () => {
+      if (this.closed) return;
+      try {
+        await loadFrameDocument(
+          this.session,
+          this.loadDocument!,
+          () => this.closed,
+        );
+      } catch {
+        if (!this.closed)
+          this.listeners.forEach((listener) =>
+            listener({ kind: 'standalone-required' }),
+          );
+      }
+    });
+  }
+
   private async reinstall(reopen: boolean): Promise<void> {
     if (this.closed) {
       return;
@@ -215,18 +250,20 @@ class RemoteDedicatedRendererConnection implements DedicatedRendererConnection {
       expectedProject: this.project,
       openSurface: reopen,
     };
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 150; attempt++) {
       try {
         await this.session.send('Page.setBypassCSP', { enabled: true });
         const installation = await install(
           this.session,
           replacementRequest,
+          this.profile,
           this.bindingName,
           ++this.generation,
         );
         if (installation.status === 'attached') {
           this.context = installation.context;
           this.open = installation.open;
+          if (this.open) this.queueDocument();
           this.listeners.forEach((listener) =>
             listener({ kind: 'context', context: this.context }),
           );
@@ -250,13 +287,23 @@ class RemoteDedicatedRendererConnection implements DedicatedRendererConnection {
       this.listeners.clear();
       await this.refresh;
     }
-    await evaluate(this.session, 'globalThis.__codexGitBridge?.close()').catch(
-      () => undefined,
-    );
+    let nativeCleanupFailed: boolean;
+    try {
+      const response = await evaluate(
+        this.session,
+        'globalThis.__codexGitBridge?.close()',
+      );
+      nativeCleanupFailed =
+        isRecord(response) && response.exceptionDetails !== undefined;
+    } catch {
+      nativeCleanupFailed = true;
+    }
     if (this.cspLease !== null) {
       await this.cspLease.release();
       this.cspLease = null;
     }
+    if (nativeCleanupFailed)
+      throw new Error('The native Codex surface could not be restored');
     await this.session.close();
   }
 }
@@ -264,17 +311,23 @@ class RemoteDedicatedRendererConnection implements DedicatedRendererConnection {
 async function install(
   session: CdpSession,
   request: ConnectDedicatedRendererRequest,
+  profile: CodexCompatibilityProfile,
   bindingName: string,
   generation: number,
 ): Promise<Installation> {
   const input: BridgeInput = {
     bindingName,
+    documentInjection: profile.documentInjection === true,
+    entryInsertionSelector: profile.entryInsertionSelector,
     expectedProject: request.expectedProject,
     generation,
+    mainSurfaceSelector: profile.mainSurfaceSelector,
+    nativeEntrySelector: profile.nativeEntrySelector,
     openSurface: request.openSurface,
     projectPath: request.projectPath,
     surfaceTitle: request.surface.title,
     surfaceUrl: request.surface.url.href,
+    sidebarSelector: profile.sidebarSelector,
   };
   const response = await evaluate(
     session,
@@ -365,7 +418,10 @@ function parseProject(value: unknown): DedicatedProjectIdentity | null {
 }
 
 function parseHostContext(value: unknown): HostContext | null {
-  if (!isRecord(value) || typeof value.projectPath !== 'string') {
+  if (
+    !isRecord(value) ||
+    (value.projectPath !== null && typeof value.projectPath !== 'string')
+  ) {
     return null;
   }
   if (
@@ -413,29 +469,46 @@ function wait(milliseconds: number): Promise<void> {
 }
 
 interface BridgeInput {
+  readonly documentInjection: boolean;
   readonly bindingName: string;
+  readonly entryInsertionSelector: string | null;
   readonly expectedProject: DedicatedProjectIdentity | null;
   readonly generation: number;
+  readonly mainSurfaceSelector: string;
+  readonly nativeEntrySelector: string;
   readonly openSurface: boolean;
   readonly projectPath: string;
   readonly surfaceTitle: string;
   readonly surfaceUrl: string;
+  readonly sidebarSelector: string;
 }
 
 // Kept self-contained because CDP serializes this function into the renderer.
 // prettier-ignore
 function installDomBridge(input: BridgeInput): unknown {
-  const root = globalThis as typeof globalThis & { __codexGitBridge?: { close(): void; restore(): void } };
+  const root = globalThis as typeof globalThis & { __codexGitBridge?: { close(): void; restore(): void; frameName(): string | null; expectDocument(name: string, nonce: string): void; documentReady(name: string): boolean } };
   root.__codexGitBridge?.close();
-  const sidebar = document.querySelector('#app-shell-sidebar');
-  const main = document.querySelector('[data-app-shell-main-surface="default"]');
+  const sidebars = document.querySelectorAll(input.sidebarSelector);
+  const mainSurfaces = document.querySelectorAll(input.mainSurfaceSelector);
+  const sidebar = sidebars.item(0);
+  const main = mainSurfaces.item(0);
   const selectedProject = document.querySelector('[data-app-action-sidebar-project-row][aria-current="page"]');
-  if (!(sidebar instanceof HTMLElement) || !(main instanceof HTMLElement) ||
-      !(selectedProject instanceof HTMLElement)) {
+  const boundRows = Array.from(document.querySelectorAll('[data-app-action-sidebar-project-row]')).filter((row) => row instanceof HTMLElement && row.dataset.appActionSidebarProjectId === input.expectedProject?.id && row.dataset.appActionSidebarProjectLabel === input.expectedProject?.label);
+  const verifiedProject = selectedProject ?? (input.expectedProject !== null && boundRows.length === 1 ? boundRows[0] : null);
+  const nativeEntry = sidebar?.querySelector(input.nativeEntrySelector);
+  const entryInsertionAnchors = input.entryInsertionSelector === null ? null :
+    sidebar?.querySelectorAll(input.entryInsertionSelector);
+  const entryInsertionAnchor = entryInsertionAnchors?.item(0) ?? null;
+  if (sidebars.length !== 1 || mainSurfaces.length !== 1 ||
+      !(sidebar instanceof HTMLElement) || !(main instanceof HTMLElement) ||
+      !(verifiedProject instanceof HTMLElement) ||
+      !(nativeEntry instanceof HTMLButtonElement) ||
+      (entryInsertionAnchors !== null && (entryInsertionAnchors.length !== 1 ||
+        !(entryInsertionAnchor instanceof HTMLElement)))) {
     return { status: 'not-ready' };
   }
-  const project = { id: selectedProject.dataset.appActionSidebarProjectId ?? '',
-    label: selectedProject.dataset.appActionSidebarProjectLabel ?? '' };
+  const project = { id: verifiedProject.dataset.appActionSidebarProjectId ?? '',
+    label: verifiedProject.dataset.appActionSidebarProjectLabel ?? '' };
   if (project.id.length === 0 || project.label.length === 0) return { status: 'incompatible' };
   if (input.expectedProject !== null && (project.id !== input.expectedProject.id ||
       project.label !== input.expectedProject.label)) {
@@ -449,15 +522,25 @@ function installDomBridge(input: BridgeInput): unknown {
   const entry = document.createElement('button');
   entry.type = 'button'; entry.dataset.codexGitSidebarEntry = ''; entry.textContent = 'Git';
   entry.setAttribute('aria-label', 'Open Codex Git');
-  const nativeEntry = sidebar.querySelector('button');
-  if (nativeEntry instanceof HTMLButtonElement) entry.className = nativeEntry.className;
+  entry.className = nativeEntry.className;
+  const entryHost = entryInsertionAnchor === null ? null :
+    document.createElement(entryInsertionAnchor.tagName.toLowerCase());
+  if (entryHost !== null && entryInsertionAnchor !== null) {
+    entryHost.dataset.codexGitSidebarEntryHost = '';
+    entryHost.className = entryInsertionAnchor.className;
+    entryHost.append(entry);
+  }
   let host: HTMLElement | null = null;
   let frame: HTMLIFrameElement | null = null;
   let capability = '', challenge = '', lastContext = '';
+  let documentNonce = '', documentLoaded = false;
+  const originalMainHidden = main.hidden;
   const context = () => {
+    const selected = document.querySelector('[data-app-action-sidebar-project-row][aria-current="page"]');
+    const projectMatches = selected instanceof HTMLElement && selected.dataset.appActionSidebarProjectId === project.id && selected.dataset.appActionSidebarProjectLabel === project.label;
     const taskRow = document.querySelector('[data-app-action-sidebar-thread-row][data-app-action-sidebar-thread-selected="true"], [data-app-action-sidebar-thread-row][aria-current="page"]');
     const task =
-      taskRow instanceof HTMLElement &&
+      projectMatches && taskRow instanceof HTMLElement &&
       typeof taskRow.dataset.appActionSidebarThreadId === 'string' &&
       typeof taskRow.dataset.appActionSidebarThreadTitle === 'string'
         ? { id: taskRow.dataset.appActionSidebarThreadId,
@@ -465,7 +548,7 @@ function installDomBridge(input: BridgeInput): unknown {
     const classes = document.documentElement.classList;
     const theme = classes.contains('electron-dark') ? 'dark' :
       classes.contains('electron-light') ? 'light' : 'system';
-    return { projectPath: input.projectPath, task, theme };
+    return { projectPath: projectMatches ? input.projectPath : null, task, theme };
   };
   const publishContext = () => {
     const next = context();
@@ -479,18 +562,21 @@ function installDomBridge(input: BridgeInput): unknown {
     }, '*');
   };
   const restore = () => {
-    frame = null; host?.remove(); host = null; main.hidden = false;
+    frame = null; documentNonce = ''; documentLoaded = false; host?.remove(); host = null; main.hidden = originalMainHidden;
     entry.removeAttribute('aria-current');
+    entry.style.removeProperty('background-color');
     notify({ kind: 'surface', open: false });
   };
   const open = () => {
+    if (entry.disabled) return;
     restore();
     host = document.createElement('main');
     host.dataset.codexGitSurface = '';
     host.setAttribute('aria-label', input.surfaceTitle);
     host.style.cssText = 'display:flex;flex:1 1 auto;min-height:0;min-width:0;overflow:hidden';
     frame = document.createElement('iframe');
-    frame.src = input.surfaceUrl; frame.title = input.surfaceTitle;
+    frame.name = `codex-git-${secret()}`;
+    frame.src = input.documentInjection ? 'about:blank' : input.surfaceUrl; frame.title = input.surfaceTitle;
     frame.setAttribute('sandbox', 'allow-scripts');
     Object.assign(frame.style, { border: '0', height: '100%', width: '100%' });
     capability = secret(); challenge = secret();
@@ -498,6 +584,7 @@ function installDomBridge(input: BridgeInput): unknown {
     host.append(frame);
     main.after(host);
     main.hidden = true; entry.setAttribute('aria-current', 'page');
+    entry.style.backgroundColor = 'var(--color-primary-ghost-hover, rgba(127, 127, 127, 0.18))';
     notify({ kind: 'surface', open: true });
   };
   const handleSidebar = (event: Event) => {
@@ -509,6 +596,7 @@ function installDomBridge(input: BridgeInput): unknown {
     if (frame === null || event.source !== frame.contentWindow ||
         typeof value !== 'object' || value === null) return;
     const message = value as Record<string, unknown>;
+    if (message.type === 'codex-git:document-ready' && documentNonce !== '' && message.nonce === documentNonce) { documentLoaded = true; publishContext(); return; }
     const action = message.action;
     if (message.type === 'codex-git:host-action' && message.capability === capability &&
         message.challenge === challenge && message.generation === input.generation &&
@@ -517,24 +605,36 @@ function installDomBridge(input: BridgeInput): unknown {
   };
   const observer = new MutationObserver(() => {
     const currentProject = document.querySelector('[data-app-action-sidebar-project-row][aria-current="page"]');
-    if (!sidebar.isConnected || !main.isConnected || !(currentProject instanceof HTMLElement) ||
-        currentProject.dataset.appActionSidebarProjectId !== project.id ||
-        currentProject.dataset.appActionSidebarProjectLabel !== project.label) {
+    if (!sidebar.isConnected || !main.isConnected || !entry.isConnected ||
+        (entryHost !== null && !entryHost.isConnected)) {
       notify({ kind: 'standalone-required' });
       return;
     }
+    // Native task pages need not mark a project row as selected. Keep the
+    // launcher's repository binding, but never attribute an unproven task.
+    const differentProject = currentProject instanceof HTMLElement &&
+      (currentProject.dataset.appActionSidebarProjectId !== project.id ||
+       currentProject.dataset.appActionSidebarProjectLabel !== project.label);
+    if (entry.disabled !== differentProject) entry.disabled = differentProject;
+    if (differentProject && host !== null) restore();
     publishContext();
   });
   const close = () => {
     observer.disconnect(); sidebar.removeEventListener('click', handleSidebar, true);
-    globalThis.removeEventListener('message', handleMessage); restore(); entry.remove();
+    globalThis.removeEventListener('message', handleMessage); restore();
+    (entryHost ?? entry).remove();
     delete root.__codexGitBridge;
   };
-  root.__codexGitBridge = { close, restore };
+  root.__codexGitBridge = { close, restore,
+    frameName: () => frame?.name ?? null,
+    expectDocument: (name, nonce) => { if (frame?.name === name) { documentNonce = nonce; documentLoaded = false; } },
+    documentReady: (name) => frame?.name === name && documentLoaded,
+  };
   entry.addEventListener('click', open);
   sidebar.addEventListener('click', handleSidebar, true);
   globalThis.addEventListener('message', handleMessage);
-  sidebar.append(entry);
+  if (entryHost !== null && entryInsertionAnchor !== null) entryInsertionAnchor.before(entryHost);
+  else sidebar.append(entry);
   observer.observe(document.documentElement, { attributes: true, childList: true, subtree: true });
   if (input.openSurface) open();
   const initialContext = context();
